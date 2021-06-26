@@ -24,6 +24,9 @@
 #include <esp_pthread.h>
 #include <sstream>
 #include <chrono>
+#include "esp_task_wdt.h"
+
+#include "driver/gpio.h"
 
 using namespace std::chrono;
 
@@ -34,11 +37,22 @@ const auto sleep_time = seconds
 
 bool thread_done = true;
 
+#define NOP() asm volatile ("nop") // 4.1ns
+#define NOP2() asm volatile ("nop;nop") // 8.3ns
+#define NOP5() asm volatile ("nop;nop;nop;nop;nop") // 20.1ns
+
+/* Settings for GPIO outputs */
+
+#define GPIO_OUTPUT_IO_0    gpio_num_t(18)
+#define GPIO_OUTPUT_IO_1    gpio_num_t(19)
+#define GPIO_OUTPUT_PIN_SEL  ((1ULL<<GPIO_OUTPUT_IO_0) | (1ULL<<GPIO_OUTPUT_IO_1))
+
 /* A simple example that demonstrates how to create GET and POST
  * handlers for the web server.
  * One of the handlers start a thread to toggle GPIO pins
  */
 
+static const char *TAG = "example";
 
 void print_thread_info(const char *extra = nullptr)
 {
@@ -55,18 +69,43 @@ void print_thread_info(const char *extra = nullptr)
 void thread_func()
 {
     thread_done = false;
-    char extra[15];
-    for (int i=0;i<10;i++) {
-        sprintf(extra, "%d : ", i);
-        print_thread_info(extra);
-        std::this_thread::sleep_for(sleep_time);
+
+    uint32_t pulses = 60*1e6;
+
+    print_thread_info();
+
+    uint32_t period_us = 1;
+
+    int64_t start_us = esp_timer_get_time();
+    int64_t end_us;
+
+    for (uint32_t count=0;count<pulses;count++) {
+
+        // Toggle pin with API method
+        // gpio_set_level(GPIO_OUTPUT_IO_0, 1);
+        // gpio_set_level(GPIO_OUTPUT_IO_0, 0);
+
+        // Toggle pin using register
+        GPIO.out_w1ts = (1 << GPIO_OUTPUT_IO_0);
+        NOP5();
+        GPIO.out_w1tc = (1 << GPIO_OUTPUT_IO_0);
+
+        // Wait the period
+        while((end_us = esp_timer_get_time()) < start_us + (count+1)*period_us) {}
     }
+
+    print_thread_info();
+
+    uint64_t duration_us = end_us - start_us;
+    ESP_LOGI(TAG, "duration_us: %" PRIu64 "", duration_us);
+
+    double rate_mhz = pulses / double(duration_us);
+    ESP_LOGI(TAG, "rate_mhz: %.3f", rate_mhz);
+
     thread_done = true;
 }
 
 std::thread* pulse_thread = NULL;
-
-static const char *TAG = "example";
 
 #if CONFIG_EXAMPLE_BASIC_AUTH
 
@@ -261,7 +300,7 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
         cfg.thread_name = "Thread 2";
         cfg.pin_to_core = 1;
         cfg.stack_size = 3 * 1024;
-        cfg.prio = 5;
+        cfg.prio = 99;
         esp_pthread_set_cfg(&cfg);
 
         ESP_LOGI(TAG, "Start new thread");
@@ -498,6 +537,7 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_ERROR_CHECK(esp_task_wdt_init(600, false));
 
     /* This helper function configures Wi-Fi or Ethernet, as selected in menuconfig.
      * Read "Establishing Wi-Fi or Ethernet Connection" section in
@@ -519,4 +559,22 @@ extern "C" void app_main(void)
 
     /* Start the server for the first time */
     server = start_webserver();
+    ESP_LOGI(TAG, "Webserver started");
+
+    ESP_LOGI(TAG, "Setting GPIO outputs");
+
+    gpio_config_t io_conf;
+    //disable interrupt
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    //set as output mode
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    //bit mask of the pins that you want to set,e.g.GPIO18/19
+    io_conf.pin_bit_mask = GPIO_OUTPUT_PIN_SEL;
+    //disable pull-down mode
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    //disable pull-up mode
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    //configure GPIO with the given settings
+    gpio_config(&io_conf);
+
 }
