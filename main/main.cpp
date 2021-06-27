@@ -78,19 +78,17 @@ void print_thread_info(const char *extra = nullptr)
     ESP_LOGI(pcTaskGetTaskName(nullptr), "%s", ss.str().c_str());
 }
 
-void thread_func()
+void thread_func(const uint64_t pulses)
 {
     thread_done = false;
-
-    uint32_t pulses = 6*1e6;
 
     print_thread_info();
 
     uint32_t period_us = 1;
-    int64_t start_us = esp_timer_get_time();
-    int64_t end_us;
+    uint32_t start_us = esp_timer_get_time();
+    uint32_t end_us = start_us;
 
-    for (uint32_t count=0;count<pulses;count++) {
+    for (uint64_t count=0;count<pulses;count++) {
 
         // Toggle pin with API method
         // gpio_set_level(GPIO_OUTPUT_IO_0, 1);
@@ -109,8 +107,8 @@ void thread_func()
 
     print_thread_info();
 
-    uint64_t duration_us = end_us - start_us;
-    ESP_LOGI(TAG, "duration_us: %" PRIu64 "", duration_us);
+    uint32_t duration_us = end_us - start_us;
+    ESP_LOGI(TAG, "duration_us: %" PRIu32 "", duration_us);
 
     double rate_mhz = pulses / double(duration_us);
     ESP_LOGI(TAG, "rate_mhz: %.3f", rate_mhz);
@@ -277,6 +275,8 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
         free(buf);
     }
 
+    uint64_t pulses = 6*1e6;
+
     /* Read URL query string length and allocate memory for length + 1,
      * extra byte for null termination */
     buf_len = httpd_req_get_url_query_len(req) + 1;
@@ -295,6 +295,14 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
             if (httpd_query_key_value(buf, "query2", param, sizeof(param)) == ESP_OK) {
                 ESP_LOGI(TAG, "Found URL query parameter => query2=%s", param);
             }
+            if (httpd_query_key_value(buf, "pulses", param, sizeof(param)) == ESP_OK) {
+                ESP_LOGI(TAG, "Found URL query parameter => pulses=%s", param);
+                double input_pulses = atof(param);
+                ESP_LOGI(TAG, "input_pulses=%f", input_pulses);
+                if(input_pulses != 0) {
+                    pulses = input_pulses;
+                }
+            }
         }
         free(buf);
     }
@@ -310,17 +318,17 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
     }
 
     /* If specific uri, start a thread if not already started */
-    if(strcmp(req->uri, "/bruno") == 0 && !pulse_thread) {
-        auto cfg = esp_pthread_get_default_config();
+    if(strncmp("/bruno", req->uri, 6) == 0 && !pulse_thread) {
+        esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
         cfg.thread_name = "Thread 2";
         cfg.pin_to_core = 1;
         cfg.stack_size = 3 * 1024;
-        cfg.prio = 99;
+        cfg.prio = 1;
         esp_pthread_set_cfg(&cfg);
 
         ESP_LOGI(TAG, "Start new thread");
-        pulse_thread = new std::thread(thread_func);
-    } else if(strcmp(req->uri, "/statistics") == 0) {
+        pulse_thread = new std::thread(thread_func, pulses);
+    } else if(strcmp("/statistics", req->uri) == 0) {
         sprintf(json_str,
             "{\"pulses_sent\": %" PRIu64 ","
             "\"last_rate_mhz\": %.3f,"
