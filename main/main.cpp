@@ -26,6 +26,10 @@
 #include <chrono>
 #include "esp_task_wdt.h"
 
+#include <xtensa/hal.h>
+
+#include "driver/timer.h"
+
 #include "driver/gpio.h"
 
 using namespace std::chrono;
@@ -50,6 +54,8 @@ bool thread_done = true;
 
 uint64_t pulses_sent = 0;
 double last_rate_mhz = -1;
+
+const uint16_t ns_per_6_cycles = 25;
 
 char json_str[256];
 
@@ -76,14 +82,37 @@ void thread_func()
 {
     thread_done = false;
 
-    uint32_t pulses = 60*1e6;
+    uint32_t pulses = 6*1e6;
 
     print_thread_info();
 
     uint32_t period_us = 1;
-
     int64_t start_us = esp_timer_get_time();
     int64_t end_us;
+
+    timer_config_t config = {
+        .alarm_en = TIMER_ALARM_DIS,
+        .counter_en = TIMER_PAUSE,
+        .intr_type = TIMER_INTR_LEVEL,
+        .counter_dir = TIMER_COUNT_UP,
+        .auto_reload = TIMER_AUTORELOAD_DIS,
+        .divider = 2, // 6 <=> 25ns
+        // .clk_src = TIMER_SRC_CLK_APB
+    }; // default clock source is APB
+
+    timer_group_t group = (timer_group_t) 0;
+    timer_idx_t timer = (timer_idx_t) 0;
+
+    // Init timer, set counter to 0 and start it
+    // No need of ISR or alarm for the moment
+    timer_init(group, timer, &config);
+    timer_set_counter_value(group, timer, 0);
+    timer_start(group, timer);
+
+    uint64_t timer_value = 0;
+    timer_get_counter_value(group, timer, &timer_value);
+
+#define USE_TIMER
 
     for (uint32_t count=0;count<pulses;count++) {
 
@@ -99,8 +128,19 @@ void thread_func()
         pulses_sent++;
 
         // Wait the period
+#ifdef USE_TIMER
+        timer_get_counter_value(group, timer, &timer_value);
+        while(timer_value < (count+1)*period_us) {
+            timer_get_counter_value(group, timer, &timer_value);
+        }
+#else
         while((end_us = esp_timer_get_time()) < start_us + (count+1)*period_us) {}
+#endif
     }
+
+#ifdef USE_TIMER
+    end_us = esp_timer_get_time();
+#endif
 
     print_thread_info();
 
@@ -318,8 +358,9 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
     } else if(strcmp(req->uri, "/statistics") == 0) {
         sprintf(json_str,
             "{\"pulses_sent\": %" PRIu64 ","
-            "\"last_rate_mhz\": %.3f}"
-            , pulses_sent, last_rate_mhz);
+            "\"last_rate_mhz\": %.3f,"
+            "\"xthal_get_ccount()\": %" PRIu32 "}"
+            , pulses_sent, last_rate_mhz, xthal_get_ccount());
         httpd_resp_set_type(req, "application/json");
     }
 
