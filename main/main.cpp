@@ -40,12 +40,18 @@ bool thread_done = true;
 #define NOP() asm volatile ("nop") // 4.1ns
 #define NOP2() asm volatile ("nop;nop") // 8.3ns
 #define NOP5() asm volatile ("nop;nop;nop;nop;nop") // 20.1ns
+#define NOP6() asm volatile ("nop;nop;nop;nop;nop;nop") // 25ns
 
 /* Settings for GPIO outputs */
 
 #define GPIO_OUTPUT_IO_0    gpio_num_t(18)
 #define GPIO_OUTPUT_IO_1    gpio_num_t(19)
 #define GPIO_OUTPUT_PIN_SEL  ((1ULL<<GPIO_OUTPUT_IO_0) | (1ULL<<GPIO_OUTPUT_IO_1))
+
+uint64_t pulses_sent = 0;
+double last_rate_mhz = -1;
+
+char json_str[256];
 
 /* A simple example that demonstrates how to create GET and POST
  * handlers for the web server.
@@ -87,8 +93,10 @@ void thread_func()
 
         // Toggle pin using register
         GPIO.out_w1ts = (1 << GPIO_OUTPUT_IO_0);
-        NOP5();
+        NOP6(); // Wait about 6*1/240 us ~ 25ns
         GPIO.out_w1tc = (1 << GPIO_OUTPUT_IO_0);
+
+        pulses_sent++;
 
         // Wait the period
         while((end_us = esp_timer_get_time()) < start_us + (count+1)*period_us) {}
@@ -101,6 +109,8 @@ void thread_func()
 
     double rate_mhz = pulses / double(duration_us);
     ESP_LOGI(TAG, "rate_mhz: %.3f", rate_mhz);
+
+    last_rate_mhz = rate_mhz;
 
     thread_done = true;
 }
@@ -305,6 +315,12 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
 
         ESP_LOGI(TAG, "Start new thread");
         pulse_thread = new std::thread(thread_func);
+    } else if(strcmp(req->uri, "/statistics") == 0) {
+        sprintf(json_str,
+            "{\"pulses_sent\": %" PRIu64 ","
+            "\"last_rate_mhz\": %.3f}"
+            , pulses_sent, last_rate_mhz);
+        httpd_resp_set_type(req, "application/json");
     }
 
     /* Set some custom headers */
@@ -314,6 +330,11 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
     /* Send response with custom headers and body set as the
      * string passed in user context*/
     const char* resp_str = (const char*) req->user_ctx;
+
+    if(strcmp(req->uri, "/statistics") == 0) {
+        resp_str = json_str;
+    }
+
     httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
 
     /* After sending the HTTP response the old HTTP request
@@ -358,6 +379,15 @@ static const httpd_uri_t solene = {
     /* Let's pass response string in user
      * context to demonstrate it's usage */
     .user_ctx  = (void*) "Salut Solène!"
+};
+
+static const httpd_uri_t statistics = {
+    .uri       = "/statistics",
+    .method    = HTTP_GET,
+    .handler   = hello_get_handler,
+    /* Let's pass response string in user
+     * context to demonstrate it's usage */
+    .user_ctx  = (void*) "Statistics!Statistics!Statistics!Statistics!Statistics!Statistics!"
 };
 
 /* An HTTP POST handler */
@@ -449,6 +479,7 @@ static esp_err_t ctrl_put_handler(httpd_req_t *req)
         httpd_unregister_uri(req->handle, "/anne-cecile");
         httpd_unregister_uri(req->handle, "/bruno");
         httpd_unregister_uri(req->handle, "/solene");
+        httpd_unregister_uri(req->handle, "/statistics");
         /* Register the custom error handler */
         httpd_register_err_handler(req->handle, HTTPD_404_NOT_FOUND, http_404_error_handler);
     }
@@ -459,6 +490,7 @@ static esp_err_t ctrl_put_handler(httpd_req_t *req)
         httpd_register_uri_handler(req->handle, &anne_cecile);
         httpd_register_uri_handler(req->handle, &bruno);
         httpd_register_uri_handler(req->handle, &solene);
+        httpd_register_uri_handler(req->handle, &statistics);
         /* Unregister custom error handler */
         httpd_register_err_handler(req->handle, HTTPD_404_NOT_FOUND, NULL);
     }
@@ -492,6 +524,7 @@ static httpd_handle_t start_webserver(void)
         httpd_register_uri_handler(server, &anne_cecile);
         httpd_register_uri_handler(server, &bruno);
         httpd_register_uri_handler(server, &solene);
+        httpd_register_uri_handler(server, &statistics);
         #if CONFIG_EXAMPLE_BASIC_AUTH
         httpd_register_basic_auth(server);
         #endif
