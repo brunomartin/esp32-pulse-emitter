@@ -113,7 +113,8 @@ void thread_func(const uint64_t pulses, const uint32_t period_us, const uint32_t
             GPIO.out_w1tc = (1 << GPIO_OUTPUT_IO_0);
 
             // Wait requested delay
-            while((end_us = esp_timer_get_time()) < start_us + count*period_us + delay_us) {}
+            next_us = start_us + count*period_us + delay_us;
+            while((end_us = esp_timer_get_time()) < next_us) {}
 
             GPIO.out_w1ts = (1 << GPIO_OUTPUT_IO_1);
             NOP6(); // Wait about 6*1/240 us ~ 25ns
