@@ -53,7 +53,8 @@ bool thread_done = true;
 #define GPIO_OUTPUT_PIN_SEL  ((1ULL<<GPIO_OUTPUT_IO_0) | (1ULL<<GPIO_OUTPUT_IO_1))
 
 uint64_t pulses_sent = 0;
-double last_rate_mhz = -1;
+double last_rate_mhz = 0;
+uint32_t last_total_duration_us = 0;
 
 const uint16_t ns_per_6_cycles = 25;
 
@@ -80,7 +81,8 @@ void print_thread_info(const char *extra = nullptr)
 
 void thread_func(const uint64_t pulses, const uint32_t period_us, const uint32_t delay_us)
 {
-    const bool with_delay = delay_us > 0;
+    uint64_t count;
+    thread_done = false;
     
     if(delay_us > period_us - 1) {
         ESP_LOGI(TAG,
@@ -90,27 +92,25 @@ void thread_func(const uint64_t pulses, const uint32_t period_us, const uint32_t
             " that for the moment", delay_us, period_us);       
         thread_done = true;
         return;
+    } else if(pulses == 0) {
+        ESP_LOGI(TAG, "No pulse to send");      
+        thread_done = true;
+        return;
     }
-
-    thread_done = false;
 
     print_thread_info();
 
-    uint32_t start_us = esp_timer_get_time();
-    uint32_t end_us = start_us;
+    uint32_t start_us, end_us, next_us;
 
-    for (uint64_t count=0;count<pulses;count++) {
+    if(delay_us > 0) {
 
-        // Toggle pin with API method
-        // gpio_set_level(GPIO_OUTPUT_IO_0, 1);
-        // gpio_set_level(GPIO_OUTPUT_IO_0, 0);
+        start_us = esp_timer_get_time();
+        for (count=0;count<pulses;count++) {
 
-        // Toggle pin using register
-        GPIO.out_w1ts = (1 << GPIO_OUTPUT_IO_0);
-        NOP6(); // Wait about 6*1/240 us ~ 25ns
-        GPIO.out_w1tc = (1 << GPIO_OUTPUT_IO_0);
-
-        if(with_delay) {
+            // Toggle pin using register
+            GPIO.out_w1ts = (1 << GPIO_OUTPUT_IO_0);
+            NOP6(); // Wait about 6*1/240 us ~ 25ns
+            GPIO.out_w1tc = (1 << GPIO_OUTPUT_IO_0);
 
             // Wait requested delay
             while((end_us = esp_timer_get_time()) < start_us + count*period_us + delay_us) {}
@@ -119,18 +119,38 @@ void thread_func(const uint64_t pulses, const uint32_t period_us, const uint32_t
             NOP6(); // Wait about 6*1/240 us ~ 25ns
             GPIO.out_w1tc = (1 << GPIO_OUTPUT_IO_1);
 
+            pulses_sent++;
+
+            // Wait the period
+            next_us = start_us + (count+1)*period_us;
+            while((end_us = esp_timer_get_time()) < next_us) {}
         }
 
-        pulses_sent++;
+    } else {
 
-        // Wait the period
-        while((end_us = esp_timer_get_time()) < start_us + (count+1)*period_us) {}
+        start_us = esp_timer_get_time();
+        for (count=0;count<pulses;count++) {
+
+            // Toggle pin using register
+            GPIO.out_w1ts = (1 << GPIO_OUTPUT_IO_0);
+            NOP6(); // Wait about 6*1/240 us ~ 25ns
+            GPIO.out_w1tc = (1 << GPIO_OUTPUT_IO_0);
+
+            pulses_sent++;
+
+            // Wait the period
+            next_us = start_us + (count+1)*period_us;
+            while((end_us = esp_timer_get_time()) < next_us) {}
+        }
+
     }
 
     print_thread_info();
 
     uint32_t duration_us = end_us - start_us;
     ESP_LOGI(TAG, "duration_us: %" PRIu32 "", duration_us);
+
+    last_total_duration_us = duration_us;
 
     double rate_mhz = pulses / double(duration_us);
     ESP_LOGI(TAG, "rate_mhz: %.3f", rate_mhz);
@@ -384,7 +404,8 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
         sprintf(json_str,
             "{\"pulses_sent\": %" PRIu64 ","
             "\"last_rate_mhz\": %.3f,"
-            , pulses_sent, last_rate_mhz);
+            "\"last_total_duration_us\": %" PRIu32 "}"
+            , pulses_sent, last_rate_mhz, last_total_duration_us);
         httpd_resp_set_type(req, "application/json");
     }
 
