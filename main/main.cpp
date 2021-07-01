@@ -78,13 +78,24 @@ void print_thread_info(const char *extra = nullptr)
     ESP_LOGI(pcTaskGetTaskName(nullptr), "%s", ss.str().c_str());
 }
 
-void thread_func(const uint64_t pulses)
+void thread_func(const uint64_t pulses, const uint32_t period_us, const uint32_t delay_us)
 {
+    const bool with_delay = delay_us > 0;
+    
+    if(delay_us > period_us - 1) {
+        ESP_LOGI(TAG,
+            "delay_us (%" PRIu32 "us) > "
+            "period_us (%" PRIu32 "us)"
+            ", This program does not handle"
+            " that for the moment", delay_us, period_us);       
+        thread_done = true;
+        return;
+    }
+
     thread_done = false;
 
     print_thread_info();
 
-    uint32_t period_us = 1;
     uint32_t start_us = esp_timer_get_time();
     uint32_t end_us = start_us;
 
@@ -98,6 +109,17 @@ void thread_func(const uint64_t pulses)
         GPIO.out_w1ts = (1 << GPIO_OUTPUT_IO_0);
         NOP6(); // Wait about 6*1/240 us ~ 25ns
         GPIO.out_w1tc = (1 << GPIO_OUTPUT_IO_0);
+
+        if(with_delay) {
+
+            // Wait requested delay
+            while((end_us = esp_timer_get_time()) < start_us + count*period_us + delay_us) {}
+
+            GPIO.out_w1ts = (1 << GPIO_OUTPUT_IO_1);
+            NOP6(); // Wait about 6*1/240 us ~ 25ns
+            GPIO.out_w1tc = (1 << GPIO_OUTPUT_IO_1);
+
+        }
 
         pulses_sent++;
 
@@ -276,6 +298,8 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
     }
 
     uint64_t pulses = 6*1e6;
+    uint32_t period_us = 1;
+    uint32_t delay_us = 0;
 
     /* Read URL query string length and allocate memory for length + 1,
      * extra byte for null termination */
@@ -295,12 +319,31 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
             if (httpd_query_key_value(buf, "query2", param, sizeof(param)) == ESP_OK) {
                 ESP_LOGI(TAG, "Found URL query parameter => query2=%s", param);
             }
+
             if (httpd_query_key_value(buf, "pulses", param, sizeof(param)) == ESP_OK) {
                 ESP_LOGI(TAG, "Found URL query parameter => pulses=%s", param);
                 double input_pulses = atof(param);
                 ESP_LOGI(TAG, "input_pulses=%f", input_pulses);
                 if(input_pulses != 0) {
                     pulses = input_pulses;
+                }
+            }
+
+            if (httpd_query_key_value(buf, "period_us", param, sizeof(param)) == ESP_OK) {
+                ESP_LOGI(TAG, "Found URL query parameter => period_us=%s", param);
+                double input_period_us = atof(param);
+                ESP_LOGI(TAG, "input_period_us=%f", input_period_us);
+                if(input_period_us != 0) {
+                    period_us = input_period_us>0?input_period_us:1;
+                }
+            }
+
+            if (httpd_query_key_value(buf, "delay_us", param, sizeof(param)) == ESP_OK) {
+                ESP_LOGI(TAG, "Found URL query parameter => delay_us=%s", param);
+                double input_delay_us = atof(param);
+                ESP_LOGI(TAG, "input_delay_us=%f", input_delay_us);
+                if(input_delay_us != 0) {
+                    delay_us = input_delay_us>0?input_delay_us:1;
                 }
             }
         }
@@ -327,7 +370,16 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
         esp_pthread_set_cfg(&cfg);
 
         ESP_LOGI(TAG, "Start new thread");
-        pulse_thread = new std::thread(thread_func, pulses);
+        ESP_LOGI(TAG, "period: %" PRIu32 "us", period_us);
+
+        if(delay_us > period_us - 1) {
+            delay_us = period_us - 1;
+            ESP_LOGI(TAG, "Force delay_us to %" PRIu32 "us", delay_us);
+        } else if(delay_us > 0) {
+            ESP_LOGI(TAG, "delay: %" PRIu32 "us", delay_us);
+        }
+
+        pulse_thread = new std::thread(thread_func, pulses, period_us, delay_us);
     } else if(strcmp("/statistics", req->uri) == 0) {
         sprintf(json_str,
             "{\"pulses_sent\": %" PRIu64 ","
