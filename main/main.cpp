@@ -32,6 +32,8 @@
 
 #include "driver/gpio.h"
 
+#include "cJSON.h"
+
 using namespace std::chrono;
 
 const auto sleep_time = seconds
@@ -59,6 +61,14 @@ uint32_t last_total_duration_us = 0;
 const uint16_t ns_per_6_cycles = 25;
 
 char json_str[256];
+
+#define SCRATCH_BUFSIZE (10240)
+
+typedef struct rest_server_context {
+    char scratch[SCRATCH_BUFSIZE];
+} rest_server_context_t;
+
+rest_server_context_t rest_context;
 
 /* A simple example that demonstrates how to create GET and POST
  * handlers for the web server.
@@ -318,10 +328,6 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
         free(buf);
     }
 
-    uint64_t pulses = 6*1e6;
-    uint32_t period_us = 1;
-    uint32_t delay_us = 0;
-
     /* Read URL query string length and allocate memory for length + 1,
      * extra byte for null termination */
     buf_len = httpd_req_get_url_query_len(req) + 1;
@@ -340,39 +346,97 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
             if (httpd_query_key_value(buf, "query2", param, sizeof(param)) == ESP_OK) {
                 ESP_LOGI(TAG, "Found URL query parameter => query2=%s", param);
             }
-
-            if (httpd_query_key_value(buf, "pulses", param, sizeof(param)) == ESP_OK) {
-                ESP_LOGI(TAG, "Found URL query parameter => pulses=%s", param);
-                double input_pulses = atof(param);
-                ESP_LOGI(TAG, "input_pulses=%f", input_pulses);
-                if(input_pulses != 0) {
-                    pulses = input_pulses;
-                }
-            }
-
-            if (httpd_query_key_value(buf, "period_us", param, sizeof(param)) == ESP_OK) {
-                ESP_LOGI(TAG, "Found URL query parameter => period_us=%s", param);
-                double input_period_us = atof(param);
-                ESP_LOGI(TAG, "input_period_us=%f", input_period_us);
-                if(input_period_us != 0) {
-                    period_us = input_period_us>0?input_period_us:1;
-                }
-            }
-
-            if (httpd_query_key_value(buf, "delay_us", param, sizeof(param)) == ESP_OK) {
-                ESP_LOGI(TAG, "Found URL query parameter => delay_us=%s", param);
-                double input_delay_us = atof(param);
-                ESP_LOGI(TAG, "input_delay_us=%f", input_delay_us);
-                if(input_delay_us != 0) {
-                    delay_us = input_delay_us>0?input_delay_us:1;
-                }
-            }
         }
         free(buf);
     }
 
+    /* Set some custom headers */
+    httpd_resp_set_hdr(req, "Custom-Header-1", "Custom-Value-1");
+    httpd_resp_set_hdr(req, "Custom-Header-2", "Custom-Value-2");
+
+    /* Send response with custom headers and body set as the
+     * string passed in user context*/
+    const char* resp_str = (const char*) req->user_ctx;
+
+    httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
+
+    /* After sending the HTTP response the old HTTP request
+     * headers are lost. Check if HTTP request headers can be read now. */
+    if (httpd_req_get_hdr_value_len(req, "Host") == 0) {
+        ESP_LOGI(TAG, "Request headers lost");
+    }
+    return ESP_OK;
+}
+
+static esp_err_t statistics_get_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "statistics_get_handler");
+    ESP_LOGI(TAG, "To display from console:\n"
+        "  watch -n 1 curl -s http://192.168.1.70/statistics ");
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "pulses_sent", pulses_sent);
+    cJSON_AddNumberToObject(root, "last_rate_mhz", last_rate_mhz);
+    cJSON_AddNumberToObject(root, "last_total_duration_us", last_total_duration_us);
+
+    const char *json_str = cJSON_Print(root);
+    httpd_resp_sendstr(req, json_str);
+    cJSON_Delete(root);
+
+    httpd_resp_set_type(req, "application/json");
+
+    return ESP_OK;
+}
+
+/* An HTTP POST handler */
+static esp_err_t action_post_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "action_post_handler");
+    ESP_LOGI(TAG, "To start from console:\n"
+        "  curl -X POST http://192.168.1.70/action -d '{\"pulses\": 10e6}' ");
+
+    uint64_t pulses = 6*1e6;
+    uint32_t period_us = 1;
+    uint32_t delay_us = 0;
+
+    int total_len = req->content_len;
+    int cur_len = 0;
+    char *buf = ((rest_server_context_t *)(req->user_ctx))->scratch;
+    int received = 0;
+    if (total_len >= SCRATCH_BUFSIZE) {
+        /* Respond with 500 Internal Server Error */
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "content too long");
+        return ESP_FAIL;
+    }
+    while (cur_len < total_len) {
+        received = httpd_req_recv(req, buf + cur_len, total_len);
+        if (received <= 0) {
+            /* Respond with 500 Internal Server Error */
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to post control value");
+            return ESP_FAIL;
+        }
+        cur_len += received;
+    }
+    buf[total_len] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+
+    if(cJSON_HasObjectItem(root, "pulses")) {
+        pulses = cJSON_GetObjectItem(root, "pulses")->valueint;
+    }
+
+    if(cJSON_HasObjectItem(root, "period_us")) {
+        period_us = cJSON_GetObjectItem(root, "period_us")->valueint;
+    }
+
+    if(cJSON_HasObjectItem(root, "delay_us")) {
+        delay_us = cJSON_GetObjectItem(root, "delay_us")->valueint;
+    }
+
+    cJSON_Delete(root);
+
     /* If thread has stopped, delete it so that we can start it
-      again */
+    again */
     if(pulse_thread && thread_done) {
         ESP_LOGI(TAG, "Delete done thread");
         // Gently join the thread before deleting it
@@ -381,8 +445,10 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
         pulse_thread = NULL;
     }
 
+    root = cJSON_CreateObject();
+
     /* If specific uri, start a thread if not already started */
-    if(strncmp("/bruno", req->uri, 6) == 0 && !pulse_thread) {
+    if(!pulse_thread) {
         esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
         cfg.thread_name = "Thread 2";
         cfg.pin_to_core = 1;
@@ -401,35 +467,22 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
         }
 
         pulse_thread = new std::thread(thread_func, pulses, period_us, delay_us);
-    } else if(strcmp("/statistics", req->uri) == 0) {
-        sprintf(json_str,
-            "{\"pulses_sent\": %" PRIu64 ","
-            "\"last_rate_mhz\": %.3f,"
-            "\"last_total_duration_us\": %" PRIu32 "}"
-            , pulses_sent, last_rate_mhz, last_total_duration_us);
-        httpd_resp_set_type(req, "application/json");
+
+        cJSON_AddStringToObject(root, "result", "ok");
+        cJSON_AddNumberToObject(root, "pulses", pulses);
+        cJSON_AddNumberToObject(root, "period_us", period_us);
+        cJSON_AddNumberToObject(root, "delay_us", delay_us);
+    } else {
+        cJSON_AddStringToObject(root, "result", "error");
+        cJSON_AddStringToObject(root, "message", "thread is still running");
     }
 
-    /* Set some custom headers */
-    httpd_resp_set_hdr(req, "Custom-Header-1", "Custom-Value-1");
-    httpd_resp_set_hdr(req, "Custom-Header-2", "Custom-Value-2");
+    const char *json_str = cJSON_Print(root);
+    httpd_resp_sendstr(req, json_str);
+    cJSON_Delete(root);
 
-    /* Send response with custom headers and body set as the
-     * string passed in user context*/
-    const char* resp_str = (const char*) req->user_ctx;
-
-    if(strcmp(req->uri, "/statistics") == 0) {
-        resp_str = json_str;
-    }
-
-    httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
-
-    /* After sending the HTTP response the old HTTP request
-     * headers are lost. Check if HTTP request headers can be read now. */
-    if (httpd_req_get_hdr_value_len(req, "Host") == 0) {
-        ESP_LOGI(TAG, "Request headers lost");
-    }
     return ESP_OK;
+
 }
 
 static const httpd_uri_t hello = {
@@ -471,10 +524,19 @@ static const httpd_uri_t solene = {
 static const httpd_uri_t statistics = {
     .uri       = "/statistics",
     .method    = HTTP_GET,
-    .handler   = hello_get_handler,
+    .handler   = statistics_get_handler,
     /* Let's pass response string in user
      * context to demonstrate it's usage */
-    .user_ctx  = (void*) "Statistics!Statistics!Statistics!Statistics!Statistics!Statistics!"
+    .user_ctx  = (void*) "Statistics!"
+};
+
+static const httpd_uri_t action = {
+    .uri       = "/action",
+    .method    = HTTP_POST,
+    .handler   = action_post_handler,
+    /* Let's pass response string in user
+     * context to demonstrate it's usage */
+    .user_ctx  = &rest_context
 };
 
 /* An HTTP POST handler */
@@ -567,6 +629,7 @@ static esp_err_t ctrl_put_handler(httpd_req_t *req)
         httpd_unregister_uri(req->handle, "/bruno");
         httpd_unregister_uri(req->handle, "/solene");
         httpd_unregister_uri(req->handle, "/statistics");
+        httpd_unregister_uri(req->handle, "/action");
         /* Register the custom error handler */
         httpd_register_err_handler(req->handle, HTTPD_404_NOT_FOUND, http_404_error_handler);
     }
@@ -578,6 +641,7 @@ static esp_err_t ctrl_put_handler(httpd_req_t *req)
         httpd_register_uri_handler(req->handle, &bruno);
         httpd_register_uri_handler(req->handle, &solene);
         httpd_register_uri_handler(req->handle, &statistics);
+        httpd_register_uri_handler(req->handle, &action);
         /* Unregister custom error handler */
         httpd_register_err_handler(req->handle, HTTPD_404_NOT_FOUND, NULL);
     }
@@ -603,6 +667,7 @@ static httpd_handle_t start_webserver(void)
     // Start the httpd server
     ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);
     if (httpd_start(&server, &config) == ESP_OK) {
+
         // Set URI handlers
         ESP_LOGI(TAG, "Registering URI handlers");
         httpd_register_uri_handler(server, &hello);
@@ -612,6 +677,7 @@ static httpd_handle_t start_webserver(void)
         httpd_register_uri_handler(server, &bruno);
         httpd_register_uri_handler(server, &solene);
         httpd_register_uri_handler(server, &statistics);
+        httpd_register_uri_handler(server, &action);
         #if CONFIG_EXAMPLE_BASIC_AUTH
         httpd_register_basic_auth(server);
         #endif
