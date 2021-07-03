@@ -40,7 +40,7 @@
 #define GPIO_OUTPUT_PIN_SEL  ((1ULL<<GPIO_OUTPUT_IO_0) | (1ULL<<GPIO_OUTPUT_IO_1))
 
 uint64_t pulses_sent = 0;
-double last_rate_mhz = 0;
+double last_rate_khz = 0;
 uint32_t last_total_duration_us = 0;
 
 #define TIMESTAMPS_SIZE 100
@@ -50,7 +50,10 @@ typedef struct task_parameters {
     uint64_t pulses;
     uint32_t period_us;
     uint32_t delay_us;
+    uint32_t timestamps[TIMESTAMPS_SIZE];
 } task_parameters_t;
+
+task_parameters_t parameters;
 
 TaskHandle_t xHandle = NULL;
 
@@ -82,13 +85,18 @@ inline void send_pulse(const gpio_num_t num) {
 
 void vTaskCode( void * pvParameters )
 {
-    const task_parameters_t* param = ((task_parameters_t *)(pvParameters));
+    task_parameters_t* param = ((task_parameters_t *)(pvParameters));
     const uint64_t pulses = param->pulses;
     const uint32_t period_us = param->period_us;
     const uint32_t delay_us = param->delay_us;
 
-    uint64_t count;
-    
+    uint64_t count, index=0;
+
+    uint32_t start_us = 0, end_us = 0, next_us = 0;
+    uint32_t duration_us;
+
+    double rate_khz;
+
     if(delay_us > period_us - 1) {
         ESP_LOGI(TAG,
             "delay_us (%" PRIu32 "us) > "
@@ -96,20 +104,15 @@ void vTaskCode( void * pvParameters )
             ", This program does not handle"
             " that for the moment", delay_us, period_us);
         vTaskDelete( xHandle );
-        xHandle = NULL;
     } else if(pulses == 0) {
         ESP_LOGI(TAG, "No pulse to send");  
         vTaskDelete( xHandle );
-        xHandle = NULL;
     }
 
     ESP_LOGI(TAG, "Start !!!");
     ESP_LOGI(TAG, "pulses: %" PRIu64 "", pulses);
     ESP_LOGI(TAG, "period_us: %" PRIu32 "", period_us);
     ESP_LOGI(TAG, "delay_us: %" PRIu32 "", delay_us);
-
-    uint32_t start_us = 0, end_us = 0, next_us = 0;
-    uint32_t duration_us;
 
     if(delay_us > 0) {
 
@@ -128,8 +131,14 @@ void vTaskCode( void * pvParameters )
             next_us = start_us + (count+1)*period_us;
             while((end_us = esp_timer_get_time()) < next_us) {}
 
-            // timestamps[pulses_sent%timestamp_size] = end_us;
+            param->timestamps[index] = end_us;
             pulses_sent++;
+
+            index++;
+            if(index > TIMESTAMPS_SIZE) {
+                index = 0;
+            }
+
         }
 
     } else {
@@ -143,8 +152,14 @@ void vTaskCode( void * pvParameters )
             next_us = start_us + (count+1)*period_us;
             while((end_us = esp_timer_get_time()) < next_us) {}
 
-            // timestamps[pulses_sent%timestamp_size] = end_us;
+            param->timestamps[index] = end_us;
             pulses_sent++;
+
+            index++;
+            if(index > TIMESTAMPS_SIZE) {
+                index = 0;
+            }
+
         }
 
     }
@@ -154,13 +169,12 @@ void vTaskCode( void * pvParameters )
 
     last_total_duration_us = duration_us;
 
-    double rate_mhz = pulses / ((double) duration_us);
-    ESP_LOGI(TAG, "rate_mhz: %.3f", rate_mhz);
+    rate_khz = 1e3 * pulses / ((double) duration_us);
+    ESP_LOGI(TAG, "rate_khz: %.3f", rate_khz);
 
-    last_rate_mhz = rate_mhz;
+    last_rate_khz = rate_khz;
 
     vTaskDelete( xHandle );
-    xHandle = NULL;
 }
 
 #if CONFIG_EXAMPLE_BASIC_AUTH
@@ -366,7 +380,7 @@ static esp_err_t statistics_get_handler(httpd_req_t *req)
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "pulses_sent", pulses_sent);
-    cJSON_AddNumberToObject(root, "last_rate_mhz", last_rate_mhz);
+    cJSON_AddNumberToObject(root, "last_rate_khz", last_rate_khz);
     cJSON_AddNumberToObject(root, "last_total_duration_us", last_total_duration_us);
 
     const char *json_str = cJSON_Print(root);
@@ -388,6 +402,8 @@ static esp_err_t action_post_handler(httpd_req_t *req)
     uint64_t pulses = 6*1e6;
     uint32_t period_us = 1;
     uint32_t delay_us = 0;
+
+    bool is_task_running = xHandle != NULL;
 
     int total_len = req->content_len;
     int cur_len = 0;
@@ -427,22 +443,40 @@ static esp_err_t action_post_handler(httpd_req_t *req)
 
     root = cJSON_CreateObject();
 
-    /* If specific uri, start a task if not already started */
-    if(!xHandle) {
+    if(xHandle) {
+        TaskStatus_t xTaskDetails;
+        vTaskGetInfo(xHandle,
+                        &xTaskDetails,
+                        pdTRUE, // Include the high water mark in xTaskDetails.
+                        eInvalid ); // Include the task state in xTaskDetails.
+
+        is_task_running = xTaskDetails.eCurrentState == eRunning;
+    }
+
+    /* If specific uri, start a task if not already running */
+    if(!is_task_running) {
         ESP_LOGI(TAG, "Start new task");
-        ESP_LOGI(TAG, "period: %" PRIu32 "us", period_us);
+
+        if(period_us < 2) {
+            period_us = 2;
+            ESP_LOGI(TAG, "Force period to %" PRIu32 "us", delay_us);
+        } else if(delay_us > 0) {
+            ESP_LOGI(TAG, "period: %" PRIu32 "us", period_us);
+        }
 
         if(delay_us > period_us - 1) {
             delay_us = period_us - 1;
-            ESP_LOGI(TAG, "Force delay_us to %" PRIu32 "us", delay_us);
+            ESP_LOGI(TAG, "Force delay to %" PRIu32 "us", delay_us);
         } else if(delay_us > 0) {
             ESP_LOGI(TAG, "delay: %" PRIu32 "us", delay_us);
         }
 
-        task_parameters_t parameters;
         parameters.pulses = pulses;
         parameters.period_us = period_us;
         parameters.delay_us = delay_us;
+
+        memset(parameters.timestamps, 0, TIMESTAMPS_SIZE*sizeof(u_int32_t));
+
         xTaskCreatePinnedToCore( vTaskCode, "NAME", 2048, &parameters,
             ( 2 | portPRIVILEGE_BIT ), &xHandle, 1 );
         configASSERT( xHandle );
