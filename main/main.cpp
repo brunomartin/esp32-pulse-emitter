@@ -20,28 +20,13 @@
 #include "esp_tls_crypto.h"
 #include <esp_http_server.h>
 
-#include <thread>
-#include <esp_pthread.h>
-#include <sstream>
-#include <chrono>
 #include "esp_task_wdt.h"
-
-#include <xtensa/hal.h>
 
 #include "driver/timer.h"
 
 #include "driver/gpio.h"
 
 #include "cJSON.h"
-
-using namespace std::chrono;
-
-const auto sleep_time = seconds
-{
-    1
-};
-
-bool thread_done = true;
 
 #define NOP() asm volatile ("nop") // 4.1ns
 #define NOP2() asm volatile ("nop;nop") // 8.3ns
@@ -50,15 +35,24 @@ bool thread_done = true;
 
 /* Settings for GPIO outputs */
 
-#define GPIO_OUTPUT_IO_0    gpio_num_t(18)
-#define GPIO_OUTPUT_IO_1    gpio_num_t(19)
+#define GPIO_OUTPUT_IO_0    (gpio_num_t) 18
+#define GPIO_OUTPUT_IO_1    (gpio_num_t) 19
 #define GPIO_OUTPUT_PIN_SEL  ((1ULL<<GPIO_OUTPUT_IO_0) | (1ULL<<GPIO_OUTPUT_IO_1))
 
 uint64_t pulses_sent = 0;
 double last_rate_mhz = 0;
 uint32_t last_total_duration_us = 0;
 
-const uint16_t ns_per_6_cycles = 25;
+#define TIMESTAMPS_SIZE 100
+uint32_t timestamps[TIMESTAMPS_SIZE];
+
+typedef struct task_parameters {
+    uint64_t pulses;
+    uint32_t period_us;
+    uint32_t delay_us;
+} task_parameters_t;
+
+TaskHandle_t xHandle = NULL;
 
 char json_str[256];
 
@@ -72,69 +66,70 @@ rest_server_context_t rest_context;
 
 /* A simple example that demonstrates how to create GET and POST
  * handlers for the web server.
- * One of the handlers start a thread to toggle GPIO pins
+ * One of the handlers start a task to toggle GPIO pins
  */
 
 static const char *TAG = "example";
 
-void print_thread_info(const char *extra = nullptr)
-{
-    std::stringstream ss;
-    if (extra) {
-        ss << extra;
-    }
-    ss << "Core id: " << xPortGetCoreID()
-       << ", prio: " << uxTaskPriorityGet(nullptr)
-       << ", minimum free stack: " << uxTaskGetStackHighWaterMark(nullptr) << " bytes.";
-    ESP_LOGI(pcTaskGetTaskName(nullptr), "%s", ss.str().c_str());
+inline void send_pulse(const gpio_num_t num) {
+
+    // Toggle pin using register
+    GPIO.out_w1ts = (1 << num);
+    NOP6(); // Wait about 6*1/240 us ~ 25ns
+    GPIO.out_w1tc = (1 << num);
+
 }
 
-void thread_func(const uint64_t pulses, const uint32_t period_us, const uint32_t delay_us)
+void vTaskCode( void * pvParameters )
 {
+    const task_parameters_t* param = ((task_parameters_t *)(pvParameters));
+    const uint64_t pulses = param->pulses;
+    const uint32_t period_us = param->period_us;
+    const uint32_t delay_us = param->delay_us;
+
     uint64_t count;
-    thread_done = false;
     
     if(delay_us > period_us - 1) {
         ESP_LOGI(TAG,
             "delay_us (%" PRIu32 "us) > "
             "period_us (%" PRIu32 "us)"
             ", This program does not handle"
-            " that for the moment", delay_us, period_us);       
-        thread_done = true;
-        return;
+            " that for the moment", delay_us, period_us);
+        vTaskDelete( xHandle );
+        xHandle = NULL;
     } else if(pulses == 0) {
-        ESP_LOGI(TAG, "No pulse to send");      
-        thread_done = true;
-        return;
+        ESP_LOGI(TAG, "No pulse to send");  
+        vTaskDelete( xHandle );
+        xHandle = NULL;
     }
 
-    print_thread_info();
+    ESP_LOGI(TAG, "Start !!!");
+    ESP_LOGI(TAG, "pulses: %" PRIu64 "", pulses);
+    ESP_LOGI(TAG, "period_us: %" PRIu32 "", period_us);
+    ESP_LOGI(TAG, "delay_us: %" PRIu32 "", delay_us);
 
-    uint32_t start_us, end_us, next_us;
+    uint32_t start_us = 0, end_us = 0, next_us = 0;
+    uint32_t duration_us;
 
     if(delay_us > 0) {
 
         start_us = esp_timer_get_time();
         for (count=0;count<pulses;count++) {
 
-            // Toggle pin using register
-            GPIO.out_w1ts = (1 << GPIO_OUTPUT_IO_0);
-            NOP6(); // Wait about 6*1/240 us ~ 25ns
-            GPIO.out_w1tc = (1 << GPIO_OUTPUT_IO_0);
+            send_pulse(GPIO_OUTPUT_IO_0);
 
             // Wait requested delay
             next_us = start_us + count*period_us + delay_us;
             while((end_us = esp_timer_get_time()) < next_us) {}
 
-            GPIO.out_w1ts = (1 << GPIO_OUTPUT_IO_1);
-            NOP6(); // Wait about 6*1/240 us ~ 25ns
-            GPIO.out_w1tc = (1 << GPIO_OUTPUT_IO_1);
-
-            pulses_sent++;
+            send_pulse(GPIO_OUTPUT_IO_1);
 
             // Wait the period
             next_us = start_us + (count+1)*period_us;
             while((end_us = esp_timer_get_time()) < next_us) {}
+
+            // timestamps[pulses_sent%timestamp_size] = end_us;
+            pulses_sent++;
         }
 
     } else {
@@ -142,36 +137,31 @@ void thread_func(const uint64_t pulses, const uint32_t period_us, const uint32_t
         start_us = esp_timer_get_time();
         for (count=0;count<pulses;count++) {
 
-            // Toggle pin using register
-            GPIO.out_w1ts = (1 << GPIO_OUTPUT_IO_0);
-            NOP6(); // Wait about 6*1/240 us ~ 25ns
-            GPIO.out_w1tc = (1 << GPIO_OUTPUT_IO_0);
-
-            pulses_sent++;
+            send_pulse(GPIO_OUTPUT_IO_0);
 
             // Wait the period
             next_us = start_us + (count+1)*period_us;
             while((end_us = esp_timer_get_time()) < next_us) {}
+
+            // timestamps[pulses_sent%timestamp_size] = end_us;
+            pulses_sent++;
         }
 
     }
 
-    print_thread_info();
-
-    uint32_t duration_us = end_us - start_us;
+    duration_us = end_us - start_us;
     ESP_LOGI(TAG, "duration_us: %" PRIu32 "", duration_us);
 
     last_total_duration_us = duration_us;
 
-    double rate_mhz = pulses / double(duration_us);
+    double rate_mhz = pulses / ((double) duration_us);
     ESP_LOGI(TAG, "rate_mhz: %.3f", rate_mhz);
 
     last_rate_mhz = rate_mhz;
 
-    thread_done = true;
+    vTaskDelete( xHandle );
+    xHandle = NULL;
 }
-
-std::thread* pulse_thread = NULL;
 
 #if CONFIG_EXAMPLE_BASIC_AUTH
 
@@ -435,28 +425,11 @@ static esp_err_t action_post_handler(httpd_req_t *req)
 
     cJSON_Delete(root);
 
-    /* If thread has stopped, delete it so that we can start it
-    again */
-    if(pulse_thread && thread_done) {
-        ESP_LOGI(TAG, "Delete done thread");
-        // Gently join the thread before deleting it
-        pulse_thread->join();
-        delete pulse_thread;
-        pulse_thread = NULL;
-    }
-
     root = cJSON_CreateObject();
 
-    /* If specific uri, start a thread if not already started */
-    if(!pulse_thread) {
-        esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
-        cfg.thread_name = "Thread 2";
-        cfg.pin_to_core = 1;
-        cfg.stack_size = 3 * 1024;
-        cfg.prio = 1;
-        esp_pthread_set_cfg(&cfg);
-
-        ESP_LOGI(TAG, "Start new thread");
+    /* If specific uri, start a task if not already started */
+    if(!xHandle) {
+        ESP_LOGI(TAG, "Start new task");
         ESP_LOGI(TAG, "period: %" PRIu32 "us", period_us);
 
         if(delay_us > period_us - 1) {
@@ -466,7 +439,13 @@ static esp_err_t action_post_handler(httpd_req_t *req)
             ESP_LOGI(TAG, "delay: %" PRIu32 "us", delay_us);
         }
 
-        pulse_thread = new std::thread(thread_func, pulses, period_us, delay_us);
+        task_parameters_t parameters;
+        parameters.pulses = pulses;
+        parameters.period_us = period_us;
+        parameters.delay_us = delay_us;
+        xTaskCreatePinnedToCore( vTaskCode, "NAME", 2048, &parameters,
+            ( 2 | portPRIVILEGE_BIT ), &xHandle, 1 );
+        configASSERT( xHandle );
 
         cJSON_AddStringToObject(root, "result", "ok");
         cJSON_AddNumberToObject(root, "pulses", pulses);
@@ -474,7 +453,7 @@ static esp_err_t action_post_handler(httpd_req_t *req)
         cJSON_AddNumberToObject(root, "delay_us", delay_us);
     } else {
         cJSON_AddStringToObject(root, "result", "error");
-        cJSON_AddStringToObject(root, "message", "thread is still running");
+        cJSON_AddStringToObject(root, "message", "task is still running");
     }
 
     const char *json_str = cJSON_Print(root);
@@ -715,8 +694,11 @@ static void connect_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-extern "C" void app_main(void)
+void app_main(void)
 {
     static httpd_handle_t server = NULL;
 
@@ -764,3 +746,7 @@ extern "C" void app_main(void)
     gpio_config(&io_conf);
 
 }
+
+#ifdef __cplusplus
+}
+#endif
