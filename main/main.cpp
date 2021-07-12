@@ -28,6 +28,8 @@
 
 #include "cJSON.h"
 
+#include <math.h>
+
 #define NOP() asm volatile ("nop") // 4.1ns
 #define NOP2() asm volatile ("nop;nop") // 8.3ns
 #define NOP5() asm volatile ("nop;nop;nop;nop;nop") // 20.1ns
@@ -41,23 +43,24 @@
 
 uint64_t pulses_sent = 0;
 double last_rate_khz = 0;
-uint32_t last_total_duration_us = 0;
+int64_t last_total_duration_us = 0;
 
-#define TIMESTAMPS_SIZE 100
-uint32_t timestamps[TIMESTAMPS_SIZE];
+#define TIMESTAMPS_SIZE 1000
+#define MEASUREMENT_SIZE 500
 
+/* structure for pulse task, timestamps are allocated 
+  in main when application starts */
 typedef struct task_parameters {
     uint64_t pulses;
     uint32_t period_us;
     uint32_t delay_us;
-    uint32_t timestamps[TIMESTAMPS_SIZE];
+    uint64_t index;
+    int64_t* timestamps;
 } task_parameters_t;
 
 task_parameters_t parameters;
 
-TaskHandle_t xHandle = NULL;
-
-char json_str[256];
+bool task_is_running;
 
 #define SCRATCH_BUFSIZE (10240)
 
@@ -92,10 +95,12 @@ void vTaskCode( void * pvParameters )
 
     uint64_t count, index=0;
 
-    uint32_t start_us = 0, end_us = 0, next_us = 0;
-    uint32_t duration_us;
+    int64_t start_us = 0, end_us = 0, next_us = 0;
+    int64_t duration_us;
 
     double rate_khz;
+
+    task_is_running = true;
 
     if(delay_us > period_us - 1) {
         ESP_LOGI(TAG,
@@ -103,10 +108,12 @@ void vTaskCode( void * pvParameters )
             "period_us (%" PRIu32 "us)"
             ", This program does not handle"
             " that for the moment", delay_us, period_us);
-        vTaskDelete( xHandle );
+        task_is_running = false;
+        vTaskDelete(NULL);
     } else if(pulses == 0) {
-        ESP_LOGI(TAG, "No pulse to send");  
-        vTaskDelete( xHandle );
+        ESP_LOGI(TAG, "No pulse to send");
+        task_is_running = false;
+        vTaskDelete(NULL);
     }
 
     ESP_LOGI(TAG, "Start !!!");
@@ -132,10 +139,11 @@ void vTaskCode( void * pvParameters )
             while((end_us = esp_timer_get_time()) < next_us) {}
 
             param->timestamps[index] = end_us;
+            param->index = index;
             pulses_sent++;
 
             index++;
-            if(index > TIMESTAMPS_SIZE) {
+            if(index == TIMESTAMPS_SIZE) {
                 index = 0;
             }
 
@@ -153,10 +161,11 @@ void vTaskCode( void * pvParameters )
             while((end_us = esp_timer_get_time()) < next_us) {}
 
             param->timestamps[index] = end_us;
+            param->index = index;
             pulses_sent++;
 
             index++;
-            if(index > TIMESTAMPS_SIZE) {
+            if(index == TIMESTAMPS_SIZE) {
                 index = 0;
             }
 
@@ -165,7 +174,7 @@ void vTaskCode( void * pvParameters )
     }
 
     duration_us = end_us - start_us;
-    ESP_LOGI(TAG, "duration_us: %" PRIu32 "", duration_us);
+    ESP_LOGI(TAG, "duration_us: %" PRId64 "", duration_us);
 
     last_total_duration_us = duration_us;
 
@@ -174,7 +183,8 @@ void vTaskCode( void * pvParameters )
 
     last_rate_khz = rate_khz;
 
-    vTaskDelete( xHandle );
+    task_is_running = false;
+    vTaskDelete(NULL);
 }
 
 #if CONFIG_EXAMPLE_BASIC_AUTH
@@ -372,16 +382,174 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+void compute_statistics(const uint32_t* values, size_t size, uint32_t* value_min,
+    uint32_t* value_max, double* value_mean, double* value_dev) {
+
+    size_t index;
+    int32_t value;
+
+    *value_mean = 0;
+    *value_min = values[0];
+    *value_max = values[0];
+    for(index=0;index<size;index++) {
+        value = values[index];
+        *value_min = value<*value_min?value:*value_min;
+        *value_max = value>*value_max?value:*value_max;
+        *value_mean += value;
+    }
+    *value_mean /= size;
+
+    *value_dev = 0;
+    for(index=0;index<size;index++) {
+        value = values[index];
+        *value_dev += (value-*value_mean)*(value-*value_mean);
+    }
+    *value_dev /= size;
+    *value_dev = sqrt(*value_dev);
+}
+
 static esp_err_t statistics_get_handler(httpd_req_t *req)
 {
+    int64_t current_time_us;
+    int current_time_s;
+    char current_time_str[32];
+ 
+    // Timestamps and duration are in us
+    int64_t* wrapped_timestamps = NULL, *timestamps = NULL;
+    uint32_t* durations = NULL;
+    size_t size=0, wrap_size=0, index=0, duration_size=0;
+    size_t read_index=0, write_index=0;
+    uint32_t duration_min=0, duration_max=0;
+    double duration_mean=0., duration_std=0.;
+
+    current_time_us = esp_timer_get_time();
+    current_time_s = (int) current_time_us/1e6;
+
+    sprintf(current_time_str, "%d:%02d:%02d.%03d",
+        current_time_s/3600,
+        (current_time_s/60)%60,
+        current_time_s%60,
+        (int) (current_time_us/1e3)%1000);
+
     ESP_LOGI(TAG, "statistics_get_handler");
     ESP_LOGI(TAG, "To display from console:\n"
-        "  watch -n 1 curl -s http://192.168.1.70/statistics ");
+        "  watch -n 1 curl -s http://192.168.1.70/statistics");
+
+    ESP_LOGI(TAG, "current_time_us: %" PRId64 "", current_time_us);
+    ESP_LOGI(TAG, "last_total_duration_us: %" PRId64 "", last_total_duration_us);
+
+    // Allocate memory and copy content of timestamps to it
+    // Allocate twice for unwrap
+    wrapped_timestamps = (int64_t*) calloc(2*MEASUREMENT_SIZE, sizeof(int64_t));
+    memset(wrapped_timestamps, 0, 2*MEASUREMENT_SIZE*sizeof(int64_t));
+
+    timestamps = parameters.timestamps;
+    read_index = parameters.index - MEASUREMENT_SIZE;
+    write_index = 0;
+    size = MEASUREMENT_SIZE;
+
+    // parameters.timestamps may be wrapping, parameters.index is the index of
+    // the last written timestamp, parameters.timestamps shall be initialzed
+    // to null
+    if(parameters.index < MEASUREMENT_SIZE) {
+        // Copy the last part of parameters.timestamps
+        size = MEASUREMENT_SIZE - index;
+        read_index = TIMESTAMPS_SIZE - size;
+        memcpy(wrapped_timestamps + write_index, timestamps + read_index,
+            size*sizeof(int64_t));
+        
+        // Update copy variables
+        read_index = 0;
+        write_index += size;
+        size = MEASUREMENT_SIZE - size;
+    }
+
+    memcpy(wrapped_timestamps + write_index, timestamps + read_index,
+            size*sizeof(int64_t));
+
+    memset(wrapped_timestamps + MEASUREMENT_SIZE, 0, MEASUREMENT_SIZE*sizeof(int64_t));
+    
+    // Compute filled size by looking from the end
+    // X X X X .... X X X 0 0 0 0 ... 0 0 0
+    size = MEASUREMENT_SIZE;
+    while(wrapped_timestamps[size-1] == 0 && size > 0) size--;
+
+    // Compute statistics only if there is enough to compute
+    // std dev (3 timestamps <=> 2 durations)
+    if(size > 2) {
+        // find index where timestamps wraps
+        // + + + + .... + + + - - - - ... - - -
+        for(wrap_size=1;wrap_size<size;wrap_size++) {
+            if(wrapped_timestamps[wrap_size] - wrapped_timestamps[wrap_size-1] < 0) {
+                break;
+            }
+        }
+
+        // If there is no wrap, wrap_size shall be size
+        //   and we shall do nothing
+        timestamps = wrapped_timestamps;
+        if(wrap_size < size) {
+            // Copy the first part to the end and move pointer to the new start
+            memcpy(wrapped_timestamps + size, wrapped_timestamps, wrap_size*sizeof(int64_t));
+            timestamps = wrapped_timestamps + wrap_size;
+        }
+
+        // Allocate and compute durations
+        duration_size = size-1;
+        durations = (uint32_t*) calloc(duration_size, sizeof(uint32_t));
+
+        for(index=0;index<duration_size;index++) {
+            durations[index] = timestamps[index+1] - timestamps[index];
+        }
+
+        compute_statistics(durations, duration_size, &duration_min,
+            &duration_max, &duration_mean, &duration_std);
+    }
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "pulses_sent", pulses_sent);
     cJSON_AddNumberToObject(root, "last_rate_khz", last_rate_khz);
+    cJSON_AddNumberToObject(root, "current_time_us", current_time_us);
+    cJSON_AddStringToObject(root, "current_time_str", current_time_str);
     cJSON_AddNumberToObject(root, "last_total_duration_us", last_total_duration_us);
+    cJSON_AddNumberToObject(root, "duration_min_us", duration_min);
+    cJSON_AddNumberToObject(root, "duration_max_us", duration_max);
+    cJSON_AddNumberToObject(root, "duration_mean_us", duration_mean);
+    cJSON_AddNumberToObject(root, "duration_std_us", duration_std);
+
+// #define STATISTICS_DEBUG
+
+#ifdef STATISTICS_DEBUG
+    // Debug output
+    cJSON_AddNumberToObject(root, "size", size);
+    cJSON_AddNumberToObject(root, "wrap_size", wrap_size);
+    cJSON_AddNumberToObject(root, "duration_size", duration_size);
+
+    cJSON *array;
+
+    array = cJSON_CreateArray();
+    for(index=0;index<2*TIMESTAMPS_SIZE;index++) {
+        cJSON_AddItemToArray(array, cJSON_CreateNumber(wrapped_timestamps[index]));
+    }
+    cJSON_AddItemToObject(root, "wrapped_timestamps", array);
+    
+    array = cJSON_CreateArray();
+    for(index=0;index<size;index++) {
+        cJSON_AddItemToArray(array, cJSON_CreateNumber(timestamps[index]));
+    }
+    cJSON_AddItemToObject(root, "timestamps", array);
+
+    array = cJSON_CreateArray();
+    for(index=0;index<duration_size;index++) {
+        cJSON_AddItemToArray(array, cJSON_CreateNumber(durations[index]));
+    }
+    cJSON_AddItemToObject(root, "durations", array);
+
+#endif // STATISTICS_DEBUG
+
+    // Free memories
+    free(durations);
+    free(wrapped_timestamps);
 
     const char *json_str = cJSON_Print(root);
     httpd_resp_sendstr(req, json_str);
@@ -397,13 +565,11 @@ static esp_err_t action_post_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG, "action_post_handler");
     ESP_LOGI(TAG, "To start from console:\n"
-        "  curl -X POST http://192.168.1.70/action -d '{\"pulses\": 10e6}' ");
+        "  curl -X POST http://192.168.1.70/action -d '{\"pulses\": 5e6, \"period_us\": 2, \"delay_us\": 1}'");
 
     uint64_t pulses = 6*1e6;
     uint32_t period_us = 1;
     uint32_t delay_us = 0;
-
-    bool is_task_running = xHandle != NULL;
 
     int total_len = req->content_len;
     int cur_len = 0;
@@ -443,18 +609,8 @@ static esp_err_t action_post_handler(httpd_req_t *req)
 
     root = cJSON_CreateObject();
 
-    if(xHandle) {
-        TaskStatus_t xTaskDetails;
-        vTaskGetInfo(xHandle,
-                        &xTaskDetails,
-                        pdTRUE, // Include the high water mark in xTaskDetails.
-                        eInvalid ); // Include the task state in xTaskDetails.
-
-        is_task_running = xTaskDetails.eCurrentState == eRunning;
-    }
-
     /* If specific uri, start a task if not already running */
-    if(!is_task_running) {
+    if(!task_is_running) {
         ESP_LOGI(TAG, "Start new task");
 
         if(period_us < 2) {
@@ -475,10 +631,11 @@ static esp_err_t action_post_handler(httpd_req_t *req)
         parameters.period_us = period_us;
         parameters.delay_us = delay_us;
 
-        memset(parameters.timestamps, 0, TIMESTAMPS_SIZE*sizeof(u_int32_t));
+        memset(parameters.timestamps, 0, TIMESTAMPS_SIZE*sizeof(int64_t));
 
-        xTaskCreatePinnedToCore( vTaskCode, "NAME", 2048, &parameters,
-            ( 2 | portPRIVILEGE_BIT ), &xHandle, 1 );
+        TaskHandle_t xHandle;
+        xTaskCreatePinnedToCore( vTaskCode, "Send pulse task", 2048, &parameters,
+            15, &xHandle, 1 );
         configASSERT( xHandle );
 
         cJSON_AddStringToObject(root, "result", "ok");
@@ -740,6 +897,9 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     ESP_ERROR_CHECK(esp_task_wdt_init(600, false));
+
+    parameters.index = 0;
+    parameters.timestamps = (int64_t*) calloc(TIMESTAMPS_SIZE, sizeof(int64_t));
 
     /* This helper function configures Wi-Fi or Ethernet, as selected in menuconfig.
      * Read "Establishing Wi-Fi or Ethernet Connection" section in
