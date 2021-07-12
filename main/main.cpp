@@ -45,8 +45,8 @@ uint64_t pulses_sent = 0;
 double last_rate_khz = 0;
 int64_t last_total_duration_us = 0;
 
-#define TIMESTAMPS_SIZE 1000
-#define MEASUREMENT_SIZE 500
+#define TIMESTAMPS_SIZE 2000
+#define MEASUREMENT_SIZE 1000
 
 /* structure for pulse task, timestamps are allocated 
   in main when application starts */
@@ -420,7 +420,7 @@ static esp_err_t statistics_get_handler(httpd_req_t *req)
     size_t size=0, wrap_size=0, index=0, duration_size=0;
     size_t read_index=0, write_index=0;
     uint32_t duration_min=0, duration_max=0;
-    double duration_mean=0., duration_std=0.;
+    double duration_mean=0., duration_std=0., rate_khz = 0.;
 
     current_time_us = esp_timer_get_time();
     current_time_s = (int) current_time_us/1e6;
@@ -504,6 +504,8 @@ static esp_err_t statistics_get_handler(httpd_req_t *req)
 
         compute_statistics(durations, duration_size, &duration_min,
             &duration_max, &duration_mean, &duration_std);
+
+        rate_khz = 1/duration_mean*1e3;
     }
 
     cJSON *root = cJSON_CreateObject();
@@ -516,6 +518,7 @@ static esp_err_t statistics_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "duration_max_us", duration_max);
     cJSON_AddNumberToObject(root, "duration_mean_us", duration_mean);
     cJSON_AddNumberToObject(root, "duration_std_us", duration_std);
+    cJSON_AddNumberToObject(root, "rate_khz", rate_khz);
 
 // #define STATISTICS_DEBUG
 
@@ -635,7 +638,7 @@ static esp_err_t action_post_handler(httpd_req_t *req)
 
         TaskHandle_t xHandle;
         xTaskCreatePinnedToCore( vTaskCode, "Send pulse task", 2048, &parameters,
-            15, &xHandle, 1 );
+            (configMAX_PRIORITIES - 1) | portPRIVILEGE_BIT, &xHandle, 1 );
         configASSERT( xHandle );
 
         cJSON_AddStringToObject(root, "result", "ok");
