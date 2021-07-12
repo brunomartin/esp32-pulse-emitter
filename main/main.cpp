@@ -34,6 +34,8 @@
 #define NOP2() asm volatile ("nop;nop") // 8.3ns
 #define NOP5() asm volatile ("nop;nop;nop;nop;nop") // 20.1ns
 #define NOP6() asm volatile ("nop;nop;nop;nop;nop;nop") // 25ns
+#define NOP12() asm volatile ("nop;nop;nop;nop;nop;nop" \
+    ";nop;nop;nop;nop;nop;nop") // 50ns
 
 /* Settings for GPIO outputs */
 
@@ -60,7 +62,8 @@ typedef struct task_parameters {
 
 task_parameters_t parameters;
 
-bool task_is_running;
+volatile bool task_is_running = false;
+volatile bool force_task_to_stop = false;
 
 #define SCRATCH_BUFSIZE (10240)
 
@@ -77,12 +80,12 @@ rest_server_context_t rest_context;
 
 static const char *TAG = "example";
 
-inline void send_pulse(const gpio_num_t num) {
+inline void send_pulse(const gpio_num_t gpio_num) {
 
     // Toggle pin using register
-    GPIO.out_w1ts = (1 << num);
-    NOP6(); // Wait about 6*1/240 us ~ 25ns
-    GPIO.out_w1tc = (1 << num);
+    GPIO.out_w1ts = (1 << gpio_num);
+    NOP12(); // Wait about 6*1/240 us ~ 25ns
+    GPIO.out_w1tc = (1 << gpio_num);
 
 }
 
@@ -93,7 +96,7 @@ void vTaskCode( void * pvParameters )
     const uint32_t period_us = param->period_us;
     const uint32_t delay_us = param->delay_us;
 
-    uint64_t count, index=0;
+    uint64_t count=-1, index=0;
 
     int64_t start_us = 0, end_us = 0, next_us = 0;
     int64_t duration_us;
@@ -101,6 +104,7 @@ void vTaskCode( void * pvParameters )
     double rate_khz;
 
     task_is_running = true;
+    force_task_to_stop = false;
 
     if(delay_us > period_us - 1) {
         ESP_LOGI(TAG,
@@ -143,9 +147,8 @@ void vTaskCode( void * pvParameters )
             pulses_sent++;
 
             index++;
-            if(index == TIMESTAMPS_SIZE) {
-                index = 0;
-            }
+            if(index == TIMESTAMPS_SIZE) index = 0;
+            if(force_task_to_stop) break;
 
         }
 
@@ -165,9 +168,8 @@ void vTaskCode( void * pvParameters )
             pulses_sent++;
 
             index++;
-            if(index == TIMESTAMPS_SIZE) {
-                index = 0;
-            }
+            if(index == TIMESTAMPS_SIZE) index = 0;
+            if(force_task_to_stop) break;
 
         }
 
@@ -178,10 +180,11 @@ void vTaskCode( void * pvParameters )
 
     last_total_duration_us = duration_us;
 
-    rate_khz = 1e3 * pulses / ((double) duration_us);
-    ESP_LOGI(TAG, "rate_khz: %.3f", rate_khz);
-
-    last_rate_khz = rate_khz;
+    if(count != -1) {
+        rate_khz = 1e3 * (count+1) / ((double) duration_us);
+        ESP_LOGI(TAG, "rate_khz: %.3f", rate_khz);
+        last_rate_khz = rate_khz;
+    }
 
     task_is_running = false;
     vTaskDelete(NULL);
@@ -519,6 +522,7 @@ static esp_err_t statistics_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "duration_mean_us", duration_mean);
     cJSON_AddNumberToObject(root, "duration_std_us", duration_std);
     cJSON_AddNumberToObject(root, "rate_khz", rate_khz);
+    cJSON_AddBoolToObject(root, "task_is_running", task_is_running);
 
 // #define STATISTICS_DEBUG
 
@@ -612,43 +616,42 @@ static esp_err_t action_post_handler(httpd_req_t *req)
 
     root = cJSON_CreateObject();
 
-    /* If specific uri, start a task if not already running */
-    if(!task_is_running) {
-        ESP_LOGI(TAG, "Start new task");
+    /* Force task to stop and wait */
+    force_task_to_stop = true;
+    while(task_is_running) {}
 
-        if(period_us < 2) {
-            period_us = 2;
-            ESP_LOGI(TAG, "Force period to %" PRIu32 "us", delay_us);
-        } else if(delay_us > 0) {
-            ESP_LOGI(TAG, "period: %" PRIu32 "us", period_us);
-        }
+    /* Start the task */
+    ESP_LOGI(TAG, "Start new task");
 
-        if(delay_us > period_us - 1) {
-            delay_us = period_us - 1;
-            ESP_LOGI(TAG, "Force delay to %" PRIu32 "us", delay_us);
-        } else if(delay_us > 0) {
-            ESP_LOGI(TAG, "delay: %" PRIu32 "us", delay_us);
-        }
-
-        parameters.pulses = pulses;
-        parameters.period_us = period_us;
-        parameters.delay_us = delay_us;
-
-        memset(parameters.timestamps, 0, TIMESTAMPS_SIZE*sizeof(int64_t));
-
-        TaskHandle_t xHandle;
-        xTaskCreatePinnedToCore( vTaskCode, "Send pulse task", 2048, &parameters,
-            (configMAX_PRIORITIES - 1) | portPRIVILEGE_BIT, &xHandle, 1 );
-        configASSERT( xHandle );
-
-        cJSON_AddStringToObject(root, "result", "ok");
-        cJSON_AddNumberToObject(root, "pulses", pulses);
-        cJSON_AddNumberToObject(root, "period_us", period_us);
-        cJSON_AddNumberToObject(root, "delay_us", delay_us);
-    } else {
-        cJSON_AddStringToObject(root, "result", "error");
-        cJSON_AddStringToObject(root, "message", "task is still running");
+    if(period_us < 2) {
+        period_us = 2;
+        ESP_LOGI(TAG, "Force period to %" PRIu32 "us", delay_us);
+    } else if(delay_us > 0) {
+        ESP_LOGI(TAG, "period: %" PRIu32 "us", period_us);
     }
+
+    if(delay_us > period_us - 1) {
+        delay_us = period_us - 1;
+        ESP_LOGI(TAG, "Force delay to %" PRIu32 "us", delay_us);
+    } else if(delay_us > 0) {
+        ESP_LOGI(TAG, "delay: %" PRIu32 "us", delay_us);
+    }
+
+    parameters.pulses = pulses;
+    parameters.period_us = period_us;
+    parameters.delay_us = delay_us;
+
+    memset(parameters.timestamps, 0, TIMESTAMPS_SIZE*sizeof(int64_t));
+
+    TaskHandle_t xHandle;
+    xTaskCreatePinnedToCore( vTaskCode, "Send pulse task", 2048, &parameters,
+        (configMAX_PRIORITIES - 1) | portPRIVILEGE_BIT, &xHandle, 1 );
+    configASSERT( xHandle );
+
+    cJSON_AddStringToObject(root, "result", "ok");
+    cJSON_AddNumberToObject(root, "pulses", pulses);
+    cJSON_AddNumberToObject(root, "period_us", period_us);
+    cJSON_AddNumberToObject(root, "delay_us", delay_us);
 
     const char *json_str = cJSON_Print(root);
     httpd_resp_sendstr(req, json_str);
