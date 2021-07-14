@@ -50,6 +50,9 @@ int64_t last_total_duration_us = 0;
 #define TIMESTAMPS_SIZE 2000
 #define MEASUREMENT_SIZE 1000
 
+int64_t* wrapped_timestamps = NULL;
+uint32_t* durations = NULL;
+
 /* structure for pulse task, timestamps are allocated 
   in main when application starts */
 typedef struct task_parameters {
@@ -146,8 +149,8 @@ void vTaskCode( void * pvParameters )
             param->index = index;
             pulses_sent++;
 
-            index++;
-            if(index == TIMESTAMPS_SIZE) index = 0;
+            if(index == TIMESTAMPS_SIZE - 1) index = 0;
+            else index++;
             if(force_task_to_stop) break;
 
         }
@@ -167,8 +170,8 @@ void vTaskCode( void * pvParameters )
             param->index = index;
             pulses_sent++;
 
-            index++;
-            if(index == TIMESTAMPS_SIZE) index = 0;
+            if(index == TIMESTAMPS_SIZE - 1) index = 0;
+            else index++;
             if(force_task_to_stop) break;
 
         }
@@ -418,8 +421,8 @@ static esp_err_t statistics_get_handler(httpd_req_t *req)
     char up_time_str[32];
  
     // Timestamps and duration are in us
-    int64_t* wrapped_timestamps = NULL, *timestamps = NULL;
-    uint32_t* durations = NULL;
+    int64_t* timestamps = NULL;
+    size_t current_index = 0;
     size_t size=0, wrap_size=0, index=0, duration_size=0;
     size_t read_index=0, write_index=0;
     uint32_t duration_min=0, duration_max=0;
@@ -443,21 +446,27 @@ static esp_err_t statistics_get_handler(httpd_req_t *req)
 
     // Allocate memory and copy content of timestamps to it
     // Allocate twice for unwrap
-    wrapped_timestamps = (int64_t*) calloc(2*MEASUREMENT_SIZE, sizeof(int64_t));
     memset(wrapped_timestamps, 0, 2*MEASUREMENT_SIZE*sizeof(int64_t));
 
     timestamps = parameters.timestamps;
-    read_index = parameters.index - MEASUREMENT_SIZE;
+
+    current_index = parameters.index;
+
+    read_index = current_index - MEASUREMENT_SIZE;
     write_index = 0;
     size = MEASUREMENT_SIZE;
 
     // parameters.timestamps may be wrapping, parameters.index is the index of
     // the last written timestamp, parameters.timestamps shall be initialzed
     // to null
-    if(parameters.index < MEASUREMENT_SIZE) {
+    if(current_index + 1 < MEASUREMENT_SIZE) {
         // Copy the last part of parameters.timestamps
-        size = MEASUREMENT_SIZE - index;
+        size = MEASUREMENT_SIZE - current_index;
         read_index = TIMESTAMPS_SIZE - size;
+        ESP_LOGI(TAG, "current_index: %zu", current_index);
+        ESP_LOGI(TAG, "read_index: %zu", read_index);
+        ESP_LOGI(TAG, "size: %zu", size);
+        ESP_LOGI(TAG, "write_index: %zu", write_index);
         memcpy(wrapped_timestamps + write_index, timestamps + read_index,
             size*sizeof(int64_t));
         
@@ -499,8 +508,7 @@ static esp_err_t statistics_get_handler(httpd_req_t *req)
 
         // Allocate and compute durations
         duration_size = size-1;
-        durations = (uint32_t*) calloc(duration_size, sizeof(uint32_t));
-
+        
         for(index=0;index<duration_size;index++) {
             durations[index] = timestamps[index+1] - timestamps[index];
         }
@@ -553,10 +561,6 @@ static esp_err_t statistics_get_handler(httpd_req_t *req)
     cJSON_AddItemToObject(root, "durations", array);
 
 #endif // STATISTICS_DEBUG
-
-    // Free memories
-    free(durations);
-    free(wrapped_timestamps);
 
     const char *json_str = cJSON_Print(root);
     httpd_resp_sendstr(req, json_str);
@@ -904,8 +908,13 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     ESP_ERROR_CHECK(esp_task_wdt_init(600, false));
 
+    // Initialize variables and allocate needed memory
+
     parameters.index = 0;
     parameters.timestamps = (int64_t*) calloc(TIMESTAMPS_SIZE, sizeof(int64_t));
+
+    wrapped_timestamps = (int64_t*) calloc(2*MEASUREMENT_SIZE, sizeof(int64_t));
+    durations = (uint32_t*) calloc(MEASUREMENT_SIZE, sizeof(uint32_t));
 
     /* This helper function configures Wi-Fi or Ethernet, as selected in menuconfig.
      * Read "Establishing Wi-Fi or Ethernet Connection" section in
