@@ -413,9 +413,9 @@ void compute_statistics(const uint32_t* values, size_t size, uint32_t* value_min
 
 static esp_err_t statistics_get_handler(httpd_req_t *req)
 {
-    int64_t current_time_us;
-    int current_time_s;
-    char current_time_str[32];
+    int64_t up_time_us;
+    int up_time_s;
+    char up_time_str[32];
  
     // Timestamps and duration are in us
     int64_t* wrapped_timestamps = NULL, *timestamps = NULL;
@@ -425,20 +425,20 @@ static esp_err_t statistics_get_handler(httpd_req_t *req)
     uint32_t duration_min=0, duration_max=0;
     double duration_mean=0., duration_std=0., rate_khz = 0.;
 
-    current_time_us = esp_timer_get_time();
-    current_time_s = (int) current_time_us/1e6;
+    up_time_us = esp_timer_get_time();
+    up_time_s = (int) (up_time_us/1e6);
 
-    sprintf(current_time_str, "%d:%02d:%02d.%03d",
-        current_time_s/3600,
-        (current_time_s/60)%60,
-        current_time_s%60,
-        (int) (current_time_us/1e3)%1000);
+    sprintf(up_time_str, "%d:%02d:%02d.%03d",
+        up_time_s/3600,
+        (up_time_s/60)%60,
+        up_time_s%60,
+        (int) (up_time_us/1e3)%1000);
 
     ESP_LOGI(TAG, "statistics_get_handler");
     ESP_LOGI(TAG, "To display from console:\n"
         "  watch -n 1 curl -s http://192.168.1.70/statistics");
 
-    ESP_LOGI(TAG, "current_time_us: %" PRId64 "", current_time_us);
+    ESP_LOGI(TAG, "up_time_us: %" PRId64 "", up_time_us);
     ESP_LOGI(TAG, "last_total_duration_us: %" PRId64 "", last_total_duration_us);
 
     // Allocate memory and copy content of timestamps to it
@@ -514,8 +514,8 @@ static esp_err_t statistics_get_handler(httpd_req_t *req)
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "pulses_sent", pulses_sent);
     cJSON_AddNumberToObject(root, "last_rate_khz", last_rate_khz);
-    cJSON_AddNumberToObject(root, "current_time_us", current_time_us);
-    cJSON_AddStringToObject(root, "current_time_str", current_time_str);
+    cJSON_AddNumberToObject(root, "up_time_us", up_time_us);
+    cJSON_AddStringToObject(root, "up_time_str", up_time_str);
     cJSON_AddNumberToObject(root, "last_total_duration_us", last_total_duration_us);
     cJSON_AddNumberToObject(root, "duration_min_us", duration_min);
     cJSON_AddNumberToObject(root, "duration_max_us", duration_max);
