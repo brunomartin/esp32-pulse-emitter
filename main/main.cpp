@@ -563,9 +563,10 @@ static esp_err_t statistics_get_handler(httpd_req_t *req)
 
 #endif // STATISTICS_DEBUG
 
-    const char *json_str = cJSON_Print(root);
+    char *json_str = cJSON_Print(root);
     httpd_resp_sendstr(req, json_str);
     cJSON_Delete(root);
+    free(json_str);
 
     httpd_resp_set_type(req, "application/json");
 
