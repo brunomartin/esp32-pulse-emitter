@@ -522,6 +522,7 @@ static esp_err_t statistics_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "duration_mean_us", duration_mean);
     cJSON_AddNumberToObject(root, "duration_std_us", duration_std);
     cJSON_AddNumberToObject(root, "rate_khz", rate_khz);
+    cJSON_AddNumberToObject(root, "free_size", heap_caps_get_free_size(MALLOC_CAP_8BIT));
     cJSON_AddBoolToObject(root, "task_is_running", task_is_running);
 
 // #define STATISTICS_DEBUG
