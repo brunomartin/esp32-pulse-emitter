@@ -26,6 +26,8 @@
 
 #include "driver/gpio.h"
 
+#include "soc/rtc.h"
+
 #include "cJSON.h"
 
 #include <math.h>
@@ -532,6 +534,8 @@ static esp_err_t statistics_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "rate_khz", rate_khz);
     cJSON_AddNumberToObject(root, "free_size", heap_caps_get_free_size(MALLOC_CAP_8BIT));
     cJSON_AddBoolToObject(root, "task_is_running", task_is_running);
+    cJSON_AddBoolToObject(root, "rtc_clk_apb_freq_get",
+        rtc_clk_apb_freq_get());
 
 // #define STATISTICS_DEBUG
 
