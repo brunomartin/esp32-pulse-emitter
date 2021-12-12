@@ -521,6 +521,9 @@ static esp_err_t statistics_get_handler(httpd_req_t *req)
         rate_khz = 1/duration_mean*1e3;
     }
 
+    rtc_cpu_freq_config_t cpu_freq_config;
+    rtc_clk_cpu_freq_get_config(&cpu_freq_config);
+
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "pulses_sent", pulses_sent);
     cJSON_AddNumberToObject(root, "last_rate_khz", last_rate_khz);
@@ -534,8 +537,8 @@ static esp_err_t statistics_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "rate_khz", rate_khz);
     cJSON_AddNumberToObject(root, "free_size", heap_caps_get_free_size(MALLOC_CAP_8BIT));
     cJSON_AddBoolToObject(root, "task_is_running", task_is_running);
-    cJSON_AddNumberToObject(root, "rtc_clk_apb_freq_get",
-        rtc_clk_apb_freq_get());
+    cJSON_AddNumberToObject(root, "cpu_freq_config.freq_mhz",
+        cpu_freq_config.freq_mhz);
 
 // #define STATISTICS_DEBUG
 
